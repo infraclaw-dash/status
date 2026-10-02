@@ -578,7 +578,9 @@ try {
 require '/var/www/html/config/db.conf.php';
 $db = mysqli_init(); $db->options(MYSQLI_OPT_CONNECT_TIMEOUT, 4);
 $db->real_connect(DB_HOST, DB_USER, DB_PASS, DB_NAME);
-$q = $db->query("SELECT COUNT(*) total, SUM(txid IS NULL OR txid='') queued, MIN(IF(txid IS NULL OR txid='', UNIX_TIMESTAMP(timestamp),NULL)) oldestQueuedAt, MAX(IF(txid IS NOT NULL AND txid!='', UNIX_TIMESTAMP(lastupdate),NULL)) lastBroadcastAt FROM faucet_payouts");
+// HotWallet writes an attempt before synchronous send; a missing txid is not
+// a queued request. Preserve that history separately from the actual queue.
+$q = $db->query("SELECT COUNT(*) total, (SELECT COUNT(*) FROM faucet_pending_payments) queued, (SELECT MIN(UNIX_TIMESTAMP(created_date)) FROM faucet_pending_payments) oldestQueuedAt, MAX(IF(txid IS NOT NULL AND txid!='', UNIX_TIMESTAMP(lastupdate),NULL)) lastBroadcastAt, COALESCE(SUM(txid IS NULL OR txid=''),0) payoutsWithoutTxidCount, MAX(IF(txid IS NULL OR txid='', UNIX_TIMESTAMP(timestamp),NULL)) lastIncompleteAttemptAt FROM faucet_payouts");
 $v = $q->fetch_assoc();
 $r = $db->query("SELECT txid FROM faucet_payouts WHERE txid IS NOT NULL AND txid!='' ORDER BY id DESC LIMIT 3");
 $v['recent'] = array(); while ($row = $r->fetch_assoc()) $v['recent'][] = $row['txid'];
@@ -589,7 +591,21 @@ echo json_encode($v);
     if not db or 'error' in db:
         out['queue'] = dict(ok=False)
         return out
-    out['queue'] = dict(ok=True, **{k: int(db[k]) if db.get(k) is not None else None for k in ('total','queued','oldestQueuedAt','lastBroadcastAt')})
+    fields = ('total','queued','oldestQueuedAt','lastBroadcastAt','payoutsWithoutTxidCount','lastIncompleteAttemptAt')
+    try:
+        if not isinstance(db, dict) or any(isinstance(db.get(k), bool) for k in fields):
+            raise ValueError('malformed queue')
+        queue = {k: int(db[k]) if db[k] is not None else None for k in fields}
+        if any(queue[k] is None or queue[k] < 0 for k in ('total','queued','payoutsWithoutTxidCount')):
+            raise ValueError('malformed queue counts')
+        if queue['payoutsWithoutTxidCount'] > queue['total'] or any(v is not None and v < 0 for v in queue.values()):
+            raise ValueError('malformed queue history')
+        if queue['queued'] > 0 and queue['oldestQueuedAt'] is None:
+            raise ValueError('missing pending payment timestamp')
+    except (KeyError, TypeError, ValueError):
+        out['queue'] = dict(ok=False)
+        return out
+    out['queue'] = dict(ok=True, **queue)
     cli, _ = core_cli(raw)
     out['payouts'] = []
     if cli:
