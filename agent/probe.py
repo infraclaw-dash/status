@@ -103,10 +103,28 @@ def is_running(c):
             and not any(state.get(k) for k in ('Restarting', 'Paused', 'Dead')))
 
 
+def explorer_component(c, component):
+    config = c.get('Config') or {}
+    labels = config.get('Labels') or {}
+    # Forks and image-ID pins have no upstream repository name. The managed
+    # services' exact Compose identity is stable across those deployments.
+    services = ('explorer-api',) if component == 'api' else ('explorer-indexer', 'explorer-migrate')
+    return (repo(config.get('Image', '')) in (
+                'ghcr.io/pshenmic/platform-explorer-' + component,
+                'ghcr.io/infraclaw-dash/platform-explorer-' + component)
+            or (labels.get('com.docker.compose.project') == 'devnet-services'
+                and labels.get('com.docker.compose.service') in services))
+
+
+def find_explorer(raw, component, running=True):
+    return next((c for _, c in sorted(raw.items()) if explorer_component(c, component)
+                 and (not running or is_running(c))), None)
+
+
 def explorer_migration(c):
     config = c.get('Config') or {}
     service = (config.get('Labels') or {}).get('com.docker.compose.service')
-    return (repo(config.get('Image', '')) == 'ghcr.io/pshenmic/platform-explorer-indexer'
+    return (explorer_component(c, 'indexer')
             and (service == 'explorer-migrate' or (config.get('Cmd') or [])[-1:] == ['migrate']))
 
 
@@ -532,7 +550,7 @@ def quorum_server(raw):
 
 
 def explorer(raw):
-    c = find(raw, ['ghcr.io/pshenmic/platform-explorer-api'])
+    c = find_explorer(raw, 'api')
     if not c:
         return None
     code, v, ms = get_json('http://127.0.0.1:3005/status', 10)
@@ -540,8 +558,7 @@ def explorer(raw):
     # The migration uses the same image as the long-running indexer. It must
     # never stand in for it, even while migrating, nor mask a crash/restart loop.
     candidates = {name: c for name, c in raw.items() if not explorer_migration(c)}
-    repos = ['ghcr.io/pshenmic/platform-explorer-indexer']
-    idx = find(candidates, repos) or find(candidates, repos, running=False)
+    idx = find_explorer(candidates, 'indexer') or find_explorer(candidates, 'indexer', running=False)
     state = (idx or {}).get('State') or {}
     api = v.get('api') if isinstance(v.get('api'), dict) else {}
     chain = v.get('tenderdash') if isinstance(v.get('tenderdash'), dict) else {}

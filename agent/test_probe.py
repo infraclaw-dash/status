@@ -16,6 +16,38 @@ def container(image, cmd=None, env=None):
 
 
 class Probes(unittest.TestCase):
+    def test_fork_and_image_id_deployments_preserve_runtime_checks(self):
+        for prefix in ['ghcr.io/infraclaw-dash/platform-explorer-', 'sha256:']:
+            api = container(prefix + 'api')
+            idx = container(prefix + 'indexer')
+            migration = container(prefix + 'indexer', ['/app/indexer', 'migrate'])
+            for c, service in [(api, 'explorer-api'), (idx, 'explorer-indexer'), (migration, 'explorer-migrate')]:
+                c['Config']['Labels'] = {'com.docker.compose.project': 'devnet-services',
+                                         'com.docker.compose.service': service}
+            migration['State'] = {'Status': 'exited', 'Running': False, 'ExitCode': 0}
+            self.assertTrue(p.explorer_migration(migration))
+            self.assertFalse(p.explorer_migration(idx))
+            for state, running in [('running', True), ('restarting', False), ('exited', False)]:
+                idx.update(Id='real-indexer', RestartCount=7,
+                           State={'Status': state, 'Running': state != 'exited', 'ExitCode': 101})
+                with patch.object(p, 'get_json', return_value=(200, {'api': {'block': {'height': 42}},
+                                                                             'tenderdash': {'block': {'height': 43}}}, 1)):
+                    check = p.explorer({'api': api, 'a-migration': migration, 'idx': idx})
+                self.assertEqual(check['indexerId'], 'real-indexer')
+                self.assertEqual(check['indexerRunning'], running)
+                self.assertEqual(check['indexerRestarts'], 7)
+                self.assertEqual(check['indexedHeight'], 42)
+                self.assertEqual(check['chainHeight'], 43)
+
+    def test_unrelated_compose_service_is_not_explorer(self):
+        c = container('sha256:' + 'a' * 64, ['migrate'])
+        for labels in [{}, {'com.docker.compose.project': 'other', 'com.docker.compose.service': 'explorer-migrate'},
+                       {'com.docker.compose.project': 'devnet-services', 'com.docker.compose.service': 'unrelated'}]:
+            c['Config']['Labels'] = labels
+            self.assertFalse(p.explorer_migration(c))
+            self.assertFalse(p.explorer_component(c, 'api'))
+            self.assertFalse(p.explorer_component(c, 'indexer'))
+
     def test_legacy_faucet_history_is_not_a_pending_payment_queue(self):
         # Actual incident aggregates: 10,373 attempts, 2,184 without txid,
         # but zero rows in faucet_pending_payments. Do not discard history.
